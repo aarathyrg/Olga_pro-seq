@@ -1,467 +1,29 @@
-#loading libraries-------------------
-library(limma)
-library(edgeR)
 library(tidyverse)
 library(ggplot2)
-library(readxl)
-library(biomaRt)
-library(stringr)
-library(ggrepel)
 library(ComplexHeatmap)
-library(patchwork)
-library(readxl)
-library(dplyr)
-library(forcats)
-library(circlize)
-library(latex2exp)
-library(patchwork)
-library(clusterProfiler)
-library(org.Mm.eg.db)  # mouse; use org.Hs.eg.db for human
 library(enrichplot)
-source("Ag_optimized_theme.R")
-# Load data-----------------
-
-data <- read.table("merged_counts.txt", header = TRUE)
-metadata <- read_excel("Conditions.xlsx") %>%
-  as.data.frame()
-
-# Clean column names in counts data
-
-colnames(data) <- gsub(
-  "X.lisc.data.scratch.decker.proseq.proseq_out.|_dedup_QC_end.sort.bam",
-  "",
-  colnames(data)
-)
-
-# Set metadata rownames and ensure Sample column is character
-
-metadata$Sample <- as.character(metadata$Sample)
-
-# Standardize Treatment
-
-metadata <- metadata %>%
-  mutate(
-    Treatment = gsub("-", "ut", Treatment),
-    Treatment = gsub("b", "IFNb", Treatment),
-    Treatment = gsub("g", "IFNg", Treatment),
-    Treatment = factor(Treatment, levels = c("ut", "IFNb", "IFNg"))
-  )
-
-# Standardize Time
-
-metadata <- metadata %>%
-  mutate(
-    Time = gsub("0", "ut", Time),
-    Time = fct_relevel(Time, "ut")
-  )
-
-# Relevel Genotype
-
-metadata <- metadata |>
-  mutate(
-    Genotype = gsub("IRF2-/-","IRF2KO",Genotype))|>
-  mutate(Genotype = fct_relevel(Genotype, "WT")
-  )
-
-
-# Create Condition factor
-
-metadata <- metadata %>%
-  mutate(
-    Condition = paste0(Treatment, "_", Time),
-    Condition = fct_relevel(Condition, "ut_ut")
-  )
-
-rownames(metadata) <- metadata$Sample
-stopifnot(all(rownames(metadata)==colnames(data)))
-# correlation plot
-corMT <- cor(data)
-diag(corMT) <- NA
-
-
-rownames(corMT)
-metadata$samples <- paste0(metadata$Condition, metadata$Genotype, metadata$Replicate)
-
-
-rownames(corMT) <- metadata$samples[match(rownames(corMT), metadata$Sample)]
-colnames(corMT) <- metadata$samples[match(colnames(corMT), metadata$Sample)]
-################
-
-#if (!dir.exists("QC_and_basic_plots")) dir.create("QC_and_basic_plots")
-
-#outfile <- file.path("QC_and_basic_plots", "Clustering_of_samples.pdf")
-#pdf(outfile, w = 25, h = 25)
-Heatmap(corMT, 
-        cluster_rows = T, 
-        clustering_method_rows = "complete",
-        clustering_method_columns = "complete",
-        row_names_gp = gpar(fontsize = 15),
-        column_names_gp = gpar(fontsize = 15))
-#dev.off()
-#design--------
-design <- model.matrix(~Condition*Genotype, data = metadata)
-
-dge <- DGEList(data)
-dge <- calcNormFactors(dge, method = "TMM")
-keep_expr <- filterByExpr(dge, design)
-dge <- dge[keep_expr,]
-
-#voom
-dataVoom <- voom(dge, design=design, plot = TRUE) # insert your model matrix
-# PCA
-# PCA on voom-transformed data
-voom_mat <- dataVoom$E   # log2-CPM values
-
-pca <- prcomp(t(voom_mat), scale. = TRUE)
-
-# Percent variance explained
-percentVar <- pca$sdev^2 / sum(pca$sdev^2) * 100
-pc1 <- round(percentVar[1], 1)
-pc2 <- round(percentVar[2], 1)
-
-# Build PCA dataframe
-pca_df <- data.frame(
-  PC1 = pca$x[,1],
-  PC2 = pca$x[,2],
-  Sample = rownames(pca$x)
-) %>%
-  left_join(metadata, by = c("Sample"))
-#
-metadata$Condition <- factor(metadata$Condition,
-                             levels = c("ut_ut","IFNb_1.5","IFNb_4","IFNb_24", "IFNb_48",
-                                        "IFNg_1.5", "IFNg_4", "IFNg_24", "IFNg_48"))
-my_colors <- list(
-  "grey","#492050", "#82498C", "#B574C2", "#D2A9DB",   
-  "#256C26","#91C392", "#4E9D4F","#C8E1C9"
-)
-
-
-# PCA plot
-ggplot(pca_df, aes(x = PC1, y = PC2, color = Condition, shape = Genotype)) +
-  geom_point(size = 4) +
-  scale_color_manual(values = my_colors)+
-  theme_bw(base_size = 14) +
-  labs(
-    x = paste0("PC1 (", pc1, "%)"),
-    y = paste0("PC2 (", pc2, "%)"),
-    title = "PCA on normalized expression data"
-  ) 
-if (!dir.exists("QC_and_basic_plots")) dir.create("QC_and_basic_plots")
-
-pca <- file.path("QC_and_basic_plots", "PCA_on normalized_expression.pdf")
-ggsave(pca)
-# -----------------------------
-limmaFit <- lmFit(dataVoom, design)
-limmaFit <- eBayes(limmaFit)
-
-# Extract results
-limmaRes <- map_dfr(colnames(coef(limmaFit)), function(coefx) {
-  topTable(limmaFit, coef = coefx, number = Inf) %>%
-    rownames_to_column("genes") %>%
-    filter(coefx != "(Intercept)") %>%
-    mutate(coef = coefx,
-           group = case_when(
-             logFC >= 1 & adj.P.Val <= 0.05 ~ "up",
-             logFC <= -1 & adj.P.Val <= 0.05 ~ "down",
-             TRUE ~ "n.s"
-           ))
-})
-
-# List all treatment conditions excluding baseline (ut_ut)
-treatments <- c("IFNb_1.5","IFNb_4","IFNb_24","IFNb_48",
-                "IFNg_1.5","IFNg_4","IFNg_24","IFNg_48")
-
-# Step 1: replace ":" with "." in design and limmaFit
-colnames(limmaFit$coefficients) <- gsub(":", ".", colnames(limmaFit$coefficients))
-colnames(limmaFit$design) <- gsub(":", ".", colnames(limmaFit$design))
-if(!is.null(limmaFit$contrasts)) {
-  colnames(limmaFit$contrasts) <- gsub(":", ".", colnames(limmaFit$contrasts))
-}
-
-# Step 2: generate contrast list using "." instead of ":"
-contrast_list <- sapply(treatments, function(trt) {
-  main <- paste0("Condition", trt)
-  inter <- paste0("Condition", trt, ".GenotypeIRF2KO")
-  paste0(main, "+", inter)
-})
-
-# Step 3: make contrast matrix using the updated coefficient names
-contrast_matrix <- makeContrasts(contrasts = contrast_list,
-                                 levels = colnames(limmaFit$coefficients))
-
-# Step 4: fit contrasts
-fit2 <- contrasts.fit(limmaFit, contrast_matrix)
-fit2 <- eBayes(fit2)
-
-limmaRes_contrasts <- map_dfr(colnames(coef(fit2)), function(coefx) {
-  topTable(fit2, coef = coefx, number = Inf) %>%
-    rownames_to_column("genes") %>%
-    mutate(
-      coef = coefx,
-      group = case_when(
-        logFC >= 1 & adj.P.Val <= 0.05 ~ "up",
-        logFC <= -1 & adj.P.Val <= 0.05 ~ "down",
-        TRUE ~ "n.s"
-      )
-    )
-})
-limmaRes <- bind_rows(limmaRes, limmaRes_contrasts)
-
-limmaRes <- limmaRes %>%
-  mutate(
-    # Remove prefixes
-    coef = str_replace_all(coef, "Condition|Genotype", ""),
-    coef = str_replace(coef, "IRF2-/-", "IRF2KO"),
-    coef = if_else(
-      str_detect(coef, "\\+"),
-      str_replace(coef, "\\+.*", "_IRF2KO"), coef ),
-    # Handle interactions (contains ":")
-    coef = if_else(
-      str_detect(coef, ":"),
-      # Replace b/g at start with IFNb/IFNg, replace : with _, append _Interaction
-      coef %>% str_replace(":", "_") %>%
-        paste0("_Interaction"),
-      coef
-    ))
-ensembl <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
-ensembl_ids <- unique(limmaRes$genes)
-gene_info <- getBM(
-  attributes = c("ensembl_gene_id", "mgi_symbol"),  # Ensembl ID → gene symbol
-  filters = "ensembl_gene_id",
-  values = ensembl_ids,
-  mart = ensembl
-)
-limmaRes$gene.name <- gene_info$mgi_symbol[match(limmaRes$genes, gene_info$ensembl_gene_id)]
-###
-#prepare tables per coef-----------
-# Split limmaRes into a list of tibbles, one per coefficient
-limmaRes_list <- limmaRes %>%
-  group_by(coef) %>%
-  group_split() %>%
-  setNames(unique(limmaRes$coef))
-
-# Create folder if it doesn't exist
-# Split by coefficient (CORRECT & SAFE)
-limmaRes_list <- split(limmaRes, limmaRes$coef)
-
-# Create output directory if needed
-if (!dir.exists("Table_of_results")) {
-  dir.create("Table_of_results")
-}
-
-# Save limma results per coefficient
-for (coef_name in names(limmaRes_list)) {
-  write.csv(
-    limmaRes_list[[coef_name]],
-    file = file.path(
-      "Table_of_results",
-      paste0("limma_results_", coef_name, ".csv")
-    ),
-    row.names = FALSE
-  )
-}
-
-
-
-#Significant results----------------------
-limmaRessig <- limmaRes %>%
-   filter(adj.P.Val < 0.05, abs(logFC)>1)
-# Split SIGNIFICANT results by coefficient
-limmaResSig_list <- split(limmaRessig, limmaRessig$coef)
-
-# Create output directory if needed
-if (!dir.exists("Table_of_SIGNIFICANT_results")) {
-  dir.create("Table_of_SIGNIFICANT_results")
-}
-
-# Save significant limma results per coefficient
-for (coef_name in names(limmaResSig_list)) {
-  write.csv(
-    limmaResSig_list[[coef_name]],
-    file = file.path(
-      "Table_of_SIGNIFICANT_results",
-      paste0("limma_SIGNIFICANT_results_", coef_name, ".csv")
-    ),
-    row.names = FALSE
-  )
-}
-
-#
-p_pval_color <- ggplot(limmaRes, aes(x = P.Value, fill = factor(floor(AveExpr)))) +
-  geom_histogram(bins = 50, color = "black", alpha = 0.8) +
-  labs(
-    title = "P-value distribution colored by average expression",
-    x = "Raw p-value",
-    fill = "floor(AveExpr)"
-  ) +
-  facet_wrap(~coef)+
-  theme_bw()
-if (!dir.exists("QC_and_basic_plots")) dir.create("QC_and_basic_plots")
-
-outfile <- file.path("QC_and_basic_plots", "Pvalue_distribution.pdf")
-ggsave(outfile, width = 18, height = 18)
-#volcano--------------------
-
-top_genes <- limmaRes %>%
-  group_by(coef) %>%
-  filter(adj.P.Val < 0.05) %>%
-  arrange(desc(abs(logFC))) %>%  # or desc(logFC) if you only care about up
-  slice_head(n = 2) %>%
-  ungroup()
-
-ggplot() +
-  # Hex background for non-significant genes
-  stat_bin_hex(
-    data = filter(limmaRes, group == "n.s"),
-    aes(x = logFC, y = -log10(adj.P.Val), fill = ..count..),
-    bins = 20, color = NA, alpha = 0.7
-  ) +
-  scale_fill_gradient(
-    low = "lightgrey",
-    high = "black",
-    limits = c(1, 5000),
-    name = "Gene Count"
-  ) +
-  
-  # Vertical cutoff lines
-  geom_vline(
-    xintercept = c(-1, 1),
-    linetype = "dashed",
-    color = "grey30",
-    linewidth = 0.4
-  ) +
-  
-  # Significant up/down genes
-  geom_point(
-    data = filter(limmaRes, group %in% c("up","down")),
-    aes(x = logFC, y = -log10(adj.P.Val), color = group),
-    alpha = 0.7
-  ) +
-  scale_color_manual(
-    values = c(
-      "up" = "#D0154E",
-      "down" = "#4C889C"
-    )
-  ) +
-  
-  # Highlight selected genes
-  geom_point(
-    data = top_genes,
-    aes(x = logFC, y = -log10(adj.P.Val)),
-    color = "black",
-    size = 0.5
-  ) +
-  
-  geom_text_repel(
-    data = top_genes,
-    aes(x = logFC, y = -log10(adj.P.Val), label = gene.name),
-    size = 2,
-    color = "black",
-    max.overlaps = 100,
-    force = 10,
-    force_pull = 0.1,
-    max.iter = 3000,
-    box.padding = 0.5,
-    point.padding = 0.4,
-    segment.color = "black",
-    segment.size = 0.3,
-    min.segment.length = 0.02,
-    arrow = arrow(length = unit(0.02, "npc"), type = "closed", angle = 25)
-  ) +
-  
-  labs(
-    title = "DEGs per comparison",
-    x = "logFC",
-    y = "-log10(adj.P)"
-  ) +
-  
-  facet_wrap(
-    ~ factor(coef, levels = c(
-      "IFNb_1.5", "IFNb_4", "IFNb_24", "IFNb_48",
-      "IFNb_1.5_IRF2KO", "IFNb_4_IRF2KO", "IFNb_24_IRF2KO", "IFNb_48_IRF2KO",
-      "IFNb_1.5_IRF2KO_Interaction", "IFNb_4_IRF2KO_Interaction",
-      "IFNb_24_IRF2KO_Interaction", "IFNb_48_IRF2KO_Interaction",
-      "IFNg_1.5", "IFNg_4", "IFNg_24", "IFNg_48",
-      "IFNg_1.5_IRF2KO", "IFNg_4_IRF2KO", "IFNg_24_IRF2KO", "IFNg_48_IRF2KO",
-      "IFNg_1.5_IRF2KO_Interaction", "IFNg_4_IRF2KO_Interaction",
-      "IFNg_24_IRF2KO_Interaction", "IFNg_48_IRF2KO_Interaction",
-      "IRF2KO"
-    )),
-    ncol = 4,
-    scales = "free"
-  ) +
-  
-  optimized_theme_fig()
-if(!dir.exists("volcano_plot")) {
-  dir.create("volcano_plot")
-}
-volcanop = file.path("volcano_plot", "volcano_plot_per_condition.pdf")
-ggsave(volcanop)
-#volcano qc with average expression----------------
-ggplot() +
-  # Hex background for non-significant genes
-  stat_bin_hex(
-    data = filter(limmaRes, group == "n.s"),
-    aes(x = logFC, y = -log10(adj.P.Val), fill = AveExpr),
-    bins = 20, color = NA, alpha = 0.7
-  ) +
-  scale_fill_gradient(
-    low = "lightgrey",
-    high = "#1589F0",  # blueish gradient for AveExpr
-    name = "AveExpr"
-  ) +
-  
-  # Vertical cutoff lines
-  geom_vline(
-    xintercept = c(-1, 1),
-    linetype = "dashed",
-    color = "grey30",
-    linewidth = 0.4
-  ) +
-  
-  # Significant up/down genes colored by AveExpr
-  geom_point(
-    data = filter(limmaRes, group %in% c("up","down")),
-    aes(x = logFC, y = -log10(adj.P.Val), color = AveExpr),
-    alpha = 0.8
-  ) +
-  scale_color_gradient(
-    low = "#4C889C",   # low expression → blue
-    high = "#D0154E",  # high expression → red
-    name = "AveExpr"
-  ) +
-  labs(
-    title = "DEGs per comparison (colored by AveExpr)",
-    x = "logFC",
-    y = "-log10(adj.P)"
-  ) +
-  
-  facet_wrap(
-    ~ factor(coef, levels = c(
-      "IFNb_1.5", "IFNb_4", "IFNb_24", "IFNb_48",
-      "IFNb_1.5_IRF2KO", "IFNb_4_IRF2KO", "IFNb_24_IRF2KO", "IFNb_48_IRF2KO",
-      "IFNb_1.5_IRF2KO_Interaction", "IFNb_4_IRF2KO_Interaction",
-      "IFNb_24_IRF2KO_Interaction", "IFNb_48_IRF2KO_Interaction",
-      "IFNg_1.5", "IFNg_4", "IFNg_24", "IFNg_48",
-      "IFNg_1.5_IRF2KO", "IFNg_4_IRF2KO", "IFNg_24_IRF2KO", "IFNg_48_IRF2KO",
-      "IFNg_1.5_IRF2KO_Interaction", "IFNg_4_IRF2KO_Interaction",
-      "IFNg_24_IRF2KO_Interaction", "IFNg_48_IRF2KO_Interaction",
-      "IRF2KO"
-    )),
-    ncol = 4,
-    scales = "free"
-  ) +
-  
-  optimized_theme_fig()
-
-if(!dir.exists("volcano_plot")) {
-  dir.create("volcano_plot")
-}
-volcanop1 = file.path("volcano_plot", "volcano_plot_per_condition_average_expression.pdf")
-ggsave(volcanop1)
-
+library(here)
+library(readr)
+library(clusterProfiler)
+library(enrichR)
+library(circlize)
+library(grid)
+source("src/Ag_optimized_theme.R")
 #############
-selected_coefs <- unique(c(grep("Interaction", limmaRessig$coef, value = TRUE), "IRF2KO"))
+# Main output directory
+outdir <- here("Results/IRF2_02_Heatmaps/")
+if (!dir.exists(outdir)) dir.create(outdir, recursive = TRUE)
+
+#load data
+
+metadata <- read_rds(here("Results/IRF2_01_DE/Processed_data/metadata.rds"))
+limmaRes <- read_rds(here("Results/IRF2_01_DE/Processed_data/limmaRes.rds"))
+dataVoom <- read_rds(here("Results/IRF2_01_DE/Processed_data/dataVoom.rds"))
+limmaRessig <- limmaRes %>%
+  filter(adj.P.Val < 0.05, abs(logFC)>1)
+
+selected_coefs <- unique(c(grep("Interaction", limmaRessig$coef, value = TRUE),
+                           "IRF2KO"))
 
 #function get relevant samples----------
 get_relevant_samples <- function(coefx, metadata) {
@@ -505,13 +67,8 @@ get_related_coefs <- function(coefx) {
   }
   stop("not valid")
 }
-unique(limmaRessig$coef)
 
 
-# limmaRessig |>
-#   filter(coef == coefx)
-
-#############
 #Expression plots_per_coef--------------
 for (coefx in selected_coefs) {
   
@@ -647,9 +204,9 @@ for (coefx in selected_coefs) {
     drop_na()
   
   p <- ggplot(dot_df,
-             aes(x = coef, y = gene.name,
-                 size = pmin(3, -log10(adj.P.Val)),
-                 fill = pmax(pmin(logFC, 2), -2))) +  # fill maps to logFC
+              aes(x = coef, y = gene.name,
+                  size = pmin(3, -log10(adj.P.Val)),
+                  fill = pmax(pmin(logFC, 2), -2))) +  # fill maps to logFC
     geom_point(shape = 21, color = "black") +
     scale_size_continuous(
       range = c(0,3),
@@ -668,10 +225,12 @@ for (coefx in selected_coefs) {
           plot.margin = margin(t = 22, r = 15, b = 22, l = 15),  # more space around plot
           panel.grid.major = element_blank(),
           panel.grid.minor = element_blank()) 
-  if(!dir.exists("logFC_per_comparison")) {
-    dir.create("logFC_per_comparison")
+  
+  logFC_plot <- file.path(outdir,"logFC_per_comparison_plots")
+  if(!dir.exists(logFC_plot)) {
+    dir.create(logFC_plot)
   }
-  file = file.path("logFC_per_comparison",
+  file = file.path(logFC_plot,
                    paste0(coefx, "dotplot.png"))
   ggsave(filename = file, p, 
          width = pmax(3,length(relevant_samples)*0.5), height=pdf_height, limitsize = F)
@@ -690,10 +249,11 @@ for (coefx in selected_coefs) {
   p1 <- ht_patch | p +
     plot_layout(widths = c(1,2), heights = 1)  # side by side, same height
   # Create folder if it doesn't exist
-  if(!dir.exists("Expression_plots_per_comparison")) {
-    dir.create("Expression_plots_per_comparison")
+  Expr_plot <-file.path(outdir,"Expression_plots_per_comparison_plots")
+  if(!dir.exists(Expr_plot)) {
+    dir.create(Expr_plot)
   }
-  file = file.path("Expression_plots_per_comparison",
+  file = file.path(Expr_plot,
                    paste0(coefx, "heatmap_dotplot.png"))
   ggsave(filename = file, p1, 
          width = length(relevant_samples)*1, height=pdf_height, limitsize = F)
@@ -748,6 +308,7 @@ col_fun <- colorRamp2(
 expr_mat_scaled <- expr_mat_scaled[, colnames(expr_mat_scaled) %in% metadata$Sample]
 
 colnames(expr_mat_scaled) <- metadata$samples[match(metadata$Sample, colnames(expr_mat_scaled))]
+
 # Order metadata to match the heatmap columns
 treatments <- c("ut_ut", "IFNb_1.5", "IFNg_1.5", "IFNb_4", "IFNg_4", 
                 "IFNb_24", "IFNg_24", "IFNb_48", "IFNg_48")
@@ -826,27 +387,7 @@ lg_condition <- Legend(
   legend_gp = gpar(fill = condition_colors)
 )
 
-# ht <- Heatmap(
-#   expr_mat_scaled,
-#   name = "Expression",
-#   col = colorRamp2(
-#     c(min(expr_mat_scaled), 0, max(expr_mat_scaled)),
-#     c("#4C889C","white","#D0154E")
-#   ),
-#   cluster_rows = TRUE,
-#   cluster_columns = FALSE,
-#   clustering_method_rows = "ward.D2",
-#   row_km = 4,
-#   row_gap = unit(3, "mm"),
-#   show_row_names = FALSE,
-#   show_column_names = TRUE,
-#   top_annotation = col_ha,
-#   row_title = "Genes",
-#   column_title = "Samples"
-# )
-library(ComplexHeatmap)
-library(circlize)
-library(grid)
+
 
 # -----------------------------
 # 1. Set seed for reproducibility
@@ -857,7 +398,7 @@ set.seed(123)
 # 2. Define number of clusters
 # -----------------------------
 number_of_clusters <- 6
-cluster_dir <- paste0("Heatmap_clustering", number_of_clusters)
+cluster_dir <- paste0(outdir,"Heatmap_clustering", number_of_clusters)
 
 # -----------------------------
 # 3. Compute row clusters (k-means)
@@ -910,7 +451,7 @@ cat("Heatmap saved to:", heatmap_file, "\n")
 
 # Draw heatmap and save the object
 ht_obj <- draw(ht)
-
+write_rds(ht_obj, paste0(outdir,"/ht_object.rds"))
 # Get row indices for each cluster (top to bottom in the heatmap)
 row_orders <- row_order(ht_obj)
 
@@ -923,7 +464,7 @@ genes_by_cluster <- lapply(row_orders, function(idx) {
   rownames(expr_mat_scaled)[idx]
 })
 names(genes_by_cluster) <- paste0("Cluster", seq_along(genes_by_cluster))
-
+write_rds(genes_by_cluster,paste0(outdir,"/genes_by_cluster.rds"))
 # Convert Ensembl IDs to gene names per cluster
 gene_names_by_cluster <- lapply(genes_by_cluster, function(ensembl_ids){
   limmaRes$gene.name[match(ensembl_ids, limmaRes$genes)]
@@ -933,12 +474,13 @@ gene_names_by_cluster <- lapply(genes_by_cluster, function(ensembl_ids){
 gene_names_by_cluster <- lapply(gene_names_by_cluster, function(x) x[!is.na(x)])
 
 # Save per-cluster CSVs
-if (!dir.exists("Genes_per_cluster")) dir.create("Genes_per_cluster")
+Genes_per_cluster <- file.path(cluster_dir,"Genes_per_cluster")
+if (!dir.exists(Genes_per_cluster)) dir.create(Genes_per_cluster)
 
 for (cl in names(gene_names_by_cluster)) {
   write.csv(
     data.frame(Gene = gene_names_by_cluster[[cl]]),
-    file = file.path("Genes_per_cluster", paste0(cl, "_genes.csv")),
+    file = file.path(Genes_per_cluster, paste0(cl, "_genes.csv")),
     row.names = FALSE
   )
 }
@@ -988,7 +530,7 @@ gene_line_plot <- function(gene_names_by_cluster){
   ggplot(data2, aes(x = Time, y = mean_E, color = Genotype, group = Genotype)) +
     geom_line(linewidth = 1.2) +
     geom_point(size = 3) +
-    scale_color_manual(values = c("WT" = "black", "IRF2KO" = "hotpink4")) +
+    scale_color_manual(values = c("WT" = "black", "IRF2KO" = "darkgreen")) +
     theme_bw() +
     labs(x = "Time (h)",
          y = "Mean expression",
@@ -1004,75 +546,34 @@ combined_plot <-
   gene_line_plot(genes_by_cluster[4]) +
   gene_line_plot(genes_by_cluster[5]) +
   gene_line_plot(genes_by_cluster[6])
-  
-  plot_layout(ncol = 2)
+
+plot_layout(ncol = 2)
 trend <- file.path(cluster_dir, "Trend_lines.pdf")
 
-# combined_plot
-# if (!dir.exists("Heatmap_clustering")) dir.create("Heatmap_clustering")
 
-# trend <- file.path("Heatmap_clustering",
-#                   "Trend_lines.pdf")
+if (!dir.exists(Genes_per_cluster)) dir.create(Genes_per_cluster)
+
+trend <- file.path(Genes_per_cluster,"Trend_lines.pdf")
 ggsave(trend,combined_plot)
 ######################################
-#enrichment------------------------
-
-# All genes in your dataset
-bg_genes <- rownames(dataVoom$E)  # Ensembl IDs
-
-cluster_enrichment <- lapply(1:length(genes_by_cluster), function(i){
-  
-  cluster_genes <- genes_by_cluster[[i]]  # Ensembl IDs
-  
-  enrichGO(gene         = cluster_genes,
-           universe     = bg_genes,
-           OrgDb        = org.Mm.eg.db,
-           keyType      = "ENSEMBL",  # Important since you have Ensembl IDs
-           ont          = "BP",        # Biological Process
-           pAdjustMethod= "BH",
-           qvalueCutoff = 0.05,
-           readable     = TRUE)        # converts Ensembl IDs to gene symbols
-})
-
-names(cluster_enrichment) <- paste0("Cluster_", 1:length(genes_by_cluster))
-
-# Dotplot for each cluster
-dir.create(paste0("Enrichment_plot",cluster_dir), showWarnings = FALSE)
-
-for (nm in names(cluster_enrichment)) {
-  
-  enr <- cluster_enrichment[[nm]]    # extract the enrichResult object
-  
-  # Skip if empty or invalid
-  if (is.null(enr) || !inherits(enr, "enrichResult")) {
-    message("Skipping ", nm, ": not an enrichResult")
-    next
-  }
-  
-  file_combined <- file.path(paste0("Enrichment_plot",cluster_dir),
-                             paste0(nm, "_Enrichment_plot.pdf"))
-  
-  pdf(file_combined, h = 10)
-  print(dotplot(enr, showCategory = 15) + ggtitle(nm))
-  dev.off()
-}
 
 ISG_core = read.delim(paste0("Mostafavi_Cell2016.tsv"))%>%
   filter(L1=="ISG_Core")%>%pull(value)
+
 
 
 #################################
 #saving normalized_table
 normalized <- dataVoom$E
 colnames(normalized) <- metadata$samples[match(colnames(normalized), metadata$Sample)]
-head(normalized)
+
 normalized <- as.data.frame(normalized)
 normalized$gene.name <- limmaRes$gene.name[
   match(rownames(normalized), limmaRes$genes)
 ]
 
 colnames(normalized) <- metadata$samples[match(colnames(normalized), metadata$Sample)]
-head(normalized)
+
 normalized <- as.data.frame(normalized)
 normalized$gene.name <- limmaRes$gene.name[
   match(rownames(normalized), limmaRes$genes)
@@ -1121,7 +622,7 @@ gene_line_plot_single <- function(gene_symbol) {
   ggplot(data2, aes(x = Time, y = mean_E, color = Genotype, group = Genotype)) +
     geom_line(linewidth = 1.2) +
     geom_point(size = 3) +
-    scale_color_manual(values = c("WT" = "black", "IRF2KO" = "hotpink4")) +
+    scale_color_manual(values = c("WT" = "black", "IRF2KO" = "darkgreen")) +
     theme_bw() +
     labs(x = "Time (h)",
          y = "Mean expression",
@@ -1144,4 +645,206 @@ sig_gene_counts <- limmaRessig %>%
   ) 
 
 # View
+
+##################
+#enrichment------------------------
+
+# All genes in your dataset
+bg_genes <- rownames(dataVoom$E)  # Ensembl IDs
+
+cluster_enrichment <- lapply(1:length(genes_by_cluster), function(i){
+  
+  cluster_genes <- genes_by_cluster[[i]]  # Ensembl IDs
+  
+  enrichGO(gene         = cluster_genes,
+           universe     = bg_genes,
+           OrgDb        = org.Mm.eg.db,
+           keyType      = "ENSEMBL",  # Important since you have Ensembl IDs
+           ont          = "BP",        # Biological Process
+           pAdjustMethod= "BH",
+           qvalueCutoff = 0.05,
+           readable     = TRUE)        # converts Ensembl IDs to gene symbols
+})
+
+names(cluster_enrichment) <- paste0("Cluster_", 1:length(genes_by_cluster))
+
+
+
+enrichment_methods <- list(
+  GO_BP = function(genes, bg) enrichGO(
+    gene = genes, universe = bg,
+    OrgDb = org.Mm.eg.db, keyType = "ENSEMBL",
+    ont = "BP", pAdjustMethod = "BH", qvalueCutoff = 0.05, readable = TRUE
+  ),
+  GO_MF = function(genes, bg) enrichGO(
+    gene = genes, universe = bg,
+    OrgDb = org.Mm.eg.db, keyType = "ENSEMBL",
+    ont = "MF", pAdjustMethod = "BH", qvalueCutoff = 0.05, readable = TRUE
+  ),
+  GO_CC = function(genes, bg) enrichGO(
+    gene = genes, universe = bg,
+    OrgDb = org.Mm.eg.db, keyType = "ENSEMBL",
+    ont = "CC", pAdjustMethod = "BH", qvalueCutoff = 0.05, readable = TRUE
+  ),
+  KEGG = function(genes, bg) enrichKEGG(
+    gene = genes,
+    universe = bg,
+    organism = "mmu",
+    pAdjustMethod = "BH",
+    qvalueCutoff = 0.05
+  )
+  # Add more (e.g. Reactome) if needed
+)
+bg_genes <- rownames(dataVoom$E)
+
+all_results <- lapply(names(enrichment_methods), function(method_name) {
+  
+  method_fun <- enrichment_methods[[method_name]]
+  
+  res <- lapply(seq_along(genes_by_cluster), function(i) {
+    cluster_genes <- genes_by_cluster[[i]]
+    method_fun(cluster_genes, bg_genes)
+  })
+  
+  names(res) <- paste0("Cluster_", seq_along(genes_by_cluster))
+  res
+})
+
+names(all_results) <- names(enrichment_methods)
+Enrichment_dir <- file.path(cluster_dir, "enrichment_cluster_profiler")
+if (!dir.exists(Enrichment_dir)) dir.create(Enrichment_dir)
+
+for (method_name in names(all_results)) {
+  method_dir <- file.path(Enrichment_dir, method_name)
+  if (!dir.exists(method_dir)) dir.create(method_dir)
+  
+  cluster_list <- all_results[[method_name]]
+  
+  for (nm in names(cluster_list)) {
+    enr <- cluster_list[[nm]]
+    
+    if (is.null(enr) || !inherits(enr, "enrichResult") || nrow(enr@result) == 0) {
+      message("Skipping ", nm, " in ", method_name)
+      next
+    }
+    
+    file_out <- file.path(method_dir, paste0(nm, "_dotplot.pdf"))
+    
+    pdf(file_out, height = 10)
+    print(dotplot(enr, showCategory = 15) + ggtitle(paste(nm, method_name)))
+    dev.off()
+  }
+}
+# Dotplot for each cluster
+Enrichment_dir <- file.path(cluster_dir,"enrichment_cluster_profiler/")
+if (!dir.exists(Enrichment_dir)) dir.create(Enrichment_dir)
+
+
+for (nm in names(cluster_enrichment)) {
+  
+  enr <- cluster_enrichment[[nm]]    # extract the enrichResult object
+  
+  # Skip if empty or invalid
+  if (is.null(enr) || !inherits(enr, "enrichResult")) {
+    message("Skipping ", nm, ": not an enrichResult")
+    next
+  }
+  
+  file_combined <- file.path(Enrichment_dir,
+                             paste0(nm, "_Enrichment_plot.pdf"))
+  
+  pdf(file_combined, h = 10)
+  print(dotplot(enr, showCategory = 15) + ggtitle(nm))
+  dev.off()
+}
+
+#enrichR----------------------------------
+
+
+enrichr_dbs <- c(
+  "GO_Biological_Process_2021",
+  "KEGG_2021_Mouse",
+  "Reactome_2022",
+  "MSigDB_Hallmark_2020",
+  "WikiPathways_2021_Mouse",
+      "TRRUST_Transcription_Factors_2019",
+    "GO_Molecular_Function_2023",
+    "GO_Biological_Process_2023",
+    "CellMarker_2024")
+
+
+enrichr_results <- lapply(seq_along(genes_by_cluster), function(i) {
+  
+  cluster_genes <- genes_by_cluster[[i]]
+  symbols <- convert_to_symbol(cluster_genes)
+  
+  if (length(symbols) == 0) return(NULL)
+  
+  enrichr(symbols, enrichr_dbs)
+})
+enrichr_long <- map_dfr(seq_along(enrichr_results), function(i) {
+  
+  cluster_name <- paste0("Cluster ", i)
+  res_list <- enrichr_results[[i]]
+  
+  if (is.null(res_list)) return(NULL)
+  
+  map_dfr(names(res_list), function(db) {
+    
+    df <- res_list[[db]]
+    
+    if (is.null(df) || nrow(df) == 0) return(NULL)
+    
+    df %>%
+      mutate(
+        Cluster = cluster_name,
+        Database = db
+      )
+  })
+})
+
+Enrichment_dir <- file.path(cluster_dir, "enrichment_enrichR")
+if (!dir.exists(Enrichment_dir)) dir.create(Enrichment_dir)
+
+plot_enrichr <- function(df, title) {
+ 
+  df <- df[order(df$Adjusted.P.value), ]
+  df <- head(df, 15)
+  
+  ggplot(df, aes(x = reorder(Term, -log10(Adjusted.P.value)),
+                 y = Cluster,
+                 size = -log10(Adjusted.P.value),
+                 color = log2(Odds.Ratio))) +
+    geom_point() +
+    scale_color_gradient(low = "white", high = "red")+
+    coord_flip() +
+    labs(
+      title = title,
+      x = "Pathway",
+      y = "Clusters",
+      size = "-log10 Adjusted P-value",
+      color = "log2(Odds.Ratio)"
+    )+
+    optimized_theme_fig()
+}
+for (db_name in enrichr_dbs) {
+  
+  dbs_res <- enrichr_long |> 
+    filter(Database == db_name)
+  
+  if (is.null(cluster_res)) next
+  
+  db_dir <- file.path(Enrichment_dir, db_name)
+  if (!dir.exists(db_dir)) dir.create(db_dir)
+  
+  
+    
+  file_out <- file.path(db_dir, paste0("enrichR", "_", db_name, "_dotplot.pdf"))
+    
+  p <- plot_enrichr(dbs_res, paste(db_name))
+    
+    pdf(file_out, height = 8, width = 10)
+    print(p)
+    dev.off()
+}
 

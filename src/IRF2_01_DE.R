@@ -290,7 +290,7 @@ for (coef_name in names(limmaRes_list)) {
 
 #Significant results----------------------
 limmaRessig <- limmaRes %>%
-   filter(adj.P.Val < 0.05, abs(logFC)>1)
+   filter(adj.P.Val < 0.05, abs(logFC)> 1)
 # Split SIGNIFICANT results by coefficient
 limmaResSig_list <- split(limmaRessig, limmaRessig$coef)
 
